@@ -1,0 +1,431 @@
+import * as vscode from 'vscode';
+import { AccountManager, AccountStore } from './AccountManager';
+import { GitManager } from './GitManager';
+import { GitHubAuth } from './GitHubAuth';
+import { GiteeAuth } from './GiteeAuth';
+
+export class GitAccountViewProvider implements vscode.WebviewViewProvider {
+  public static readonly viewType = 'gitAccountSwitcher.view';
+  private _view?: vscode.WebviewView;
+
+  constructor(private readonly _extensionUri: vscode.Uri) {}
+
+  resolveWebviewView(webviewView: vscode.WebviewView): void {
+    this._view = webviewView;
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this._extensionUri],
+    };
+    webviewView.webview.html = this._getHtmlContent();
+    webviewView.webview.onDidReceiveMessage(msg => this._handleMessage(msg));
+  }
+
+  refresh(): void {
+    if (this._view) {
+      const store = AccountManager.load();
+      this._view.webview.postMessage({ command: 'updateAccounts', accounts: store });
+    }
+  }
+
+  private async _handleMessage(message: any): Promise<void> {
+    switch (message.command) {
+      case 'ready':
+        this.refresh();
+        break;
+
+      case 'addAccount': {
+        const platform: 'github' | 'gitee' = message.platform;
+        this._sendLoading(true);
+        try {
+          let userInfo = null;
+          if (platform === 'github') {
+            userInfo = await GitHubAuth.addAccount();
+          } else {
+            userInfo = await GiteeAuth.addAccount();
+          }
+          if (userInfo) {
+            AccountManager.addAccount(platform, {
+              username: userInfo.username,
+              name: userInfo.name,
+              email: userInfo.email,
+              avatarUrl: userInfo.avatarUrl,
+              token: userInfo.token,
+            });
+            vscode.window.showInformationMessage(`✅ 已添加 ${platform === 'github' ? 'GitHub' : 'Gitee'} 账户：${userInfo.username}`);
+            this.refresh();
+          }
+        } finally {
+          this._sendLoading(false);
+        }
+        break;
+      }
+
+      case 'switchAccount': {
+        const { platform, id } = message as { platform: 'github' | 'gitee'; id: string };
+        const store = AccountManager.setActive(platform, id);
+        const account = store[platform].find(a => a.id === id);
+        if (account) {
+          try {
+            await GitManager.setGlobalUser(account.name || account.username, account.email);
+            vscode.window.showInformationMessage(
+              `✅ 已切换全局 Git 身份 → ${account.username} <${account.email}>`
+            );
+
+            const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+            if (!workspaceFolder) {
+              vscode.window.showWarningMessage('未检测到工作区，无法自动切换当前仓库的 Git 凭据。');
+            } else {
+              const remoteUrl = await GitManager.getRemoteUrl(workspaceFolder.uri.fsPath);
+              const host = remoteUrl ? GitManager.parseHostFromUrl(remoteUrl) : null;
+
+              if (!remoteUrl || !host) {
+                vscode.window.showWarningMessage('当前仓库未找到 HTTPS 远程地址，无法自动切换凭据。');
+              } else if (!GitManager.isHttpRemoteUrl(remoteUrl)) {
+                vscode.window.showWarningMessage('当前仓库远程地址不是 HTTP/HTTPS 类型，凭据切换仅支持 HTTPS 远程。');
+              } else {
+                try {
+                  await GitManager.clearCredential(host);
+                  await GitManager.storeCredential(host, account.username, account.token);
+                  vscode.window.showInformationMessage(`✅ 已为远程 host ${host} 切换推送凭据。`);
+                } catch (credErr) {
+                  vscode.window.showErrorMessage(`切换凭据失败：${credErr}`);
+                }
+              }
+            }
+          } catch (err) {
+            vscode.window.showErrorMessage(`切换失败: ${err}`);
+          }
+        }
+        this.refresh();
+        break;
+      }
+
+      case 'deleteAccount': {
+        const { platform, id } = message as { platform: 'github' | 'gitee'; id: string };
+        const store = AccountManager.load();
+        const account = store[platform].find(a => a.id === id);
+        const confirm = await vscode.window.showWarningMessage(
+          `确认删除账户 ${account?.username ?? id}？`,
+          '删除',
+          '取消'
+        );
+        if (confirm === '删除') {
+          AccountManager.deleteAccount(platform, id);
+          this.refresh();
+        }
+        break;
+      }
+    }
+  }
+
+  private _sendLoading(loading: boolean): void {
+    this._view?.webview.postMessage({ command: 'setLoading', loading });
+  }
+
+  private _getHtmlContent(): string {
+    return /* html */`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+    font-size: var(--vscode-font-size, 13px);
+    color: var(--vscode-foreground);
+    background: transparent;
+    overflow-x: hidden;
+  }
+
+  /* ── Tabs ── */
+  .tabs {
+    display: flex;
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    position: sticky;
+    top: 0;
+    background: var(--vscode-sideBar-background, #252526);
+    z-index: 10;
+  }
+  .tab-btn {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 0;
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: var(--vscode-foreground);
+    opacity: 0.6;
+    border-bottom: 2px solid transparent;
+    font-size: 13px;
+    font-family: inherit;
+    transition: opacity 0.15s, border-color 0.15s;
+  }
+  .tab-btn:hover { opacity: 0.9; background: var(--vscode-list-hoverBackground); }
+  .tab-btn.active { opacity: 1; border-bottom-color: var(--vscode-focusBorder, #007fd4); }
+  .tab-btn svg { flex-shrink: 0; }
+
+  /* ── Content ── */
+  .tab-content { display: none; padding: 8px 0; }
+  .tab-content.visible { display: block; }
+
+  /* ── Account item ── */
+  .account-list { display: flex; flex-direction: column; gap: 2px; padding: 0 6px; }
+
+  .account-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    position: relative;
+    transition: background 0.1s;
+  }
+  .account-item:hover { background: var(--vscode-list-hoverBackground); }
+  .account-item.is-active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+
+  .avatar {
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    object-fit: cover;
+    flex-shrink: 0;
+    background: var(--vscode-panel-border);
+  }
+  .avatar-placeholder {
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    background: var(--vscode-button-background, #0e639c);
+    display: flex; align-items: center; justify-content: center;
+    color: white; font-weight: 600; font-size: 15px;
+    flex-shrink: 0;
+  }
+
+  .account-info { flex: 1; min-width: 0; }
+  .account-username { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .account-email { font-size: 11px; opacity: 0.65; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .active-badge {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #4ec94e;
+    flex-shrink: 0;
+  }
+
+  .delete-btn {
+    display: none;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--vscode-errorForeground, #f48771);
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-size: 14px;
+    line-height: 1;
+  }
+  .account-item:hover .delete-btn { display: flex; align-items: center; }
+  .delete-btn:hover { background: var(--vscode-inputValidation-errorBackground); }
+
+  /* ── Add button ── */
+  .add-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: calc(100% - 12px);
+    margin: 6px 6px 4px;
+    padding: 8px;
+    background: none;
+    border: 1px dashed var(--vscode-panel-border, #555);
+    color: var(--vscode-foreground);
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+    opacity: 0.7;
+    transition: opacity 0.1s, background 0.1s;
+  }
+  .add-btn:hover { opacity: 1; background: var(--vscode-list-hoverBackground); }
+
+  /* ── Empty state ── */
+  .empty-state {
+    text-align: center;
+    padding: 24px 16px 8px;
+    opacity: 0.5;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  /* ── Loading overlay ── */
+  .loading-mask {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.4);
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .loading-mask.visible { display: flex; }
+  .spinner {
+    width: 24px; height: 24px;
+    border: 2px solid rgba(255,255,255,0.2);
+    border-top-color: var(--vscode-focusBorder, #007fd4);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<!-- Tabs -->
+<div class="tabs">
+  <button class="tab-btn active" id="tab-github" onclick="switchTab('github')">
+    <!-- GitHub Mark SVG -->
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+               0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
+               -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
+               .07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15
+               -.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27
+               .68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12
+               .51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48
+               0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+    </svg>
+    GitHub
+  </button>
+  <button class="tab-btn" id="tab-gitee" onclick="switchTab('gitee')">
+    <!-- Gitee Logo SVG (simplified) -->
+    <svg width="16" height="16" viewBox="0 0 32 32" fill="currentColor">
+      <path d="M16 0C7.163 0 0 7.163 0 16s7.163 16 16 16 16-7.163 16-16S24.837 0 16 0z
+               M8.5 22.5v-13h5.25c2.9 0 4.75 1.5 4.75 4 0 1.6-.8 2.8-2.1 3.4l2.85 5.6h-3.2
+               l-2.5-5h-1.8v5H8.5zm3.25-7.5h1.85c1.15 0 1.9-.65 1.9-1.75S14.75 11.5 13.6 11.5
+               h-1.85V15zM21 22.5v-13h3.25V22.5H21z"/>
+    </svg>
+    Gitee
+  </button>
+</div>
+
+<!-- GitHub Tab Content -->
+<div class="tab-content visible" id="content-github">
+  <div class="account-list" id="list-github"></div>
+  <button class="add-btn" onclick="addAccount('github')">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+      <path d="M8 2a.75.75 0 01.75.75v4.5h4.5a.75.75 0 010 1.5h-4.5v4.5a.75.75 0 01-1.5
+               0v-4.5h-4.5a.75.75 0 010-1.5h4.5v-4.5A.75.75 0 018 2z"/>
+    </svg>
+    添加 GitHub 账户
+  </button>
+</div>
+
+<!-- Gitee Tab Content -->
+<div class="tab-content" id="content-gitee">
+  <div class="account-list" id="list-gitee"></div>
+  <button class="add-btn" onclick="addAccount('gitee')">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+      <path d="M8 2a.75.75 0 01.75.75v4.5h4.5a.75.75 0 010 1.5h-4.5v4.5a.75.75 0 01-1.5
+               0v-4.5h-4.5a.75.75 0 010-1.5h4.5v-4.5A.75.75 0 018 2z"/>
+    </svg>
+    添加 Gitee 账户
+  </button>
+</div>
+
+<!-- Loading Mask -->
+<div class="loading-mask" id="loadingMask">
+  <div class="spinner"></div>
+</div>
+
+<script>
+  const vscode = acquireVsCodeApi();
+  let accounts = { github: [], gitee: [] };
+  let currentTab = 'github';
+
+  // ── Tab switching ──
+  function switchTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('visible'));
+    document.getElementById('tab-' + tab).classList.add('active');
+    document.getElementById('content-' + tab).classList.add('visible');
+  }
+
+  // ── Message handlers ──
+  function addAccount(platform) {
+    vscode.postMessage({ command: 'addAccount', platform });
+  }
+  function switchAccount(platform, id) {
+    vscode.postMessage({ command: 'switchAccount', platform, id });
+  }
+  function deleteAccount(platform, id, event) {
+    event.stopPropagation();
+    vscode.postMessage({ command: 'deleteAccount', platform, id });
+  }
+
+  // ── Render ──
+  function renderList(platform) {
+    const list = document.getElementById('list-' + platform);
+    const items = accounts[platform] || [];
+
+    if (items.length === 0) {
+      list.innerHTML = '<div class="empty-state">暂无账户<br>点击下方按钮添加</div>';
+      return;
+    }
+
+    list.innerHTML = items.map(acc => {
+      const isActive = acc.active;
+      const initial = (acc.username || '?')[0].toUpperCase();
+      const avatarHtml = acc.avatarUrl
+        ? '<img class="avatar" src="' + escHtml(acc.avatarUrl) + '" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'flex\\'"/>'
+          + '<div class="avatar-placeholder" style="display:none">' + escHtml(initial) + '</div>'
+        : '<div class="avatar-placeholder">' + escHtml(initial) + '</div>';
+
+      return \`
+        <div class="account-item \${isActive ? 'is-active' : ''}"
+             onclick="switchAccount('\${platform}', '\${escHtml(acc.id)}')">
+          \${avatarHtml}
+          <div class="account-info">
+            <div class="account-username">\${escHtml(acc.username)}</div>
+            <div class="account-email">\${escHtml(acc.email || acc.name || '')}</div>
+          </div>
+          \${isActive ? '<div class="active-badge" title="当前激活"></div>' : ''}
+          <button class="delete-btn" title="删除账户"
+                  onclick="deleteAccount('\${platform}', '\${escHtml(acc.id)}', event)">✕</button>
+        </div>
+      \`;
+    }).join('');
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  // ── Message listener ──
+  window.addEventListener('message', event => {
+    const msg = event.data;
+    if (msg.command === 'updateAccounts') {
+      accounts = msg.accounts;
+      renderList('github');
+      renderList('gitee');
+    } else if (msg.command === 'setLoading') {
+      const mask = document.getElementById('loadingMask');
+      mask.classList.toggle('visible', msg.loading);
+    }
+  });
+
+  // Init
+  vscode.postMessage({ command: 'ready' });
+</script>
+</body>
+</html>`;
+  }
+}
