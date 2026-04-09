@@ -3,6 +3,8 @@ import { AccountManager, AccountStore } from './AccountManager';
 import { GitManager } from './GitManager';
 import { GitHubAuth } from './GitHubAuth';
 import { GiteeAuth } from './GiteeAuth';
+import { GitLabAuth } from './GitLabAuth';
+import { PLATFORM_META, Platform } from './platform';
 
 export class GitAccountViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'gitAccountSwitcher.view';
@@ -16,7 +18,7 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
       enableScripts: true,
       localResourceRoots: [this._extensionUri],
     };
-    webviewView.webview.html = this._getHtmlContent();
+    webviewView.webview.html = this._getHtmlContent(webviewView.webview);
     webviewView.webview.onDidReceiveMessage(msg => this._handleMessage(msg));
   }
 
@@ -30,19 +32,15 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
   private async _handleMessage(message: any): Promise<void> {
     switch (message.command) {
       case 'ready':
+      case 'refresh':
         this.refresh();
         break;
 
       case 'addAccount': {
-        const platform: 'github' | 'gitee' = message.platform;
+        const platform = message.platform as Platform;
         this._sendLoading(true);
         try {
-          let userInfo = null;
-          if (platform === 'github') {
-            userInfo = await GitHubAuth.addAccount();
-          } else {
-            userInfo = await GiteeAuth.addAccount();
-          }
+          const userInfo = await this._addAccountForPlatform(platform);
           if (userInfo) {
             AccountManager.addAccount(platform, {
               username: userInfo.username,
@@ -51,7 +49,7 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
               avatarUrl: userInfo.avatarUrl,
               token: userInfo.token,
             });
-            vscode.window.showInformationMessage(`✅ 已添加 ${platform === 'github' ? 'GitHub' : 'Gitee'} 账户：${userInfo.username}`);
+            vscode.window.showInformationMessage(`✅ 已添加 ${PLATFORM_META[platform].label} 账户：${userInfo.username}`);
             this.refresh();
           }
         } finally {
@@ -61,12 +59,13 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
       }
 
       case 'switchAccount': {
-        const { platform, id } = message as { platform: 'github' | 'gitee'; id: string };
-        const store = AccountManager.setActive(platform, id);
+        const { platform, id } = message as { platform: Platform; id: string };
+        const store = AccountManager.load();
         const account = store[platform].find(a => a.id === id);
         if (account) {
           try {
             await GitManager.setGlobalUser(account.name || account.username, account.email);
+            AccountManager.setActive(platform, id);
             vscode.window.showInformationMessage(
               `✅ 已切换全局 Git 身份 → ${account.username} <${account.email}>`
             );
@@ -75,21 +74,15 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
             if (!workspaceFolder) {
               vscode.window.showWarningMessage('未检测到工作区，无法自动切换当前仓库的 Git 凭据。');
             } else {
-              const remoteUrl = await GitManager.getRemoteUrl(workspaceFolder.uri.fsPath);
-              const host = remoteUrl ? GitManager.parseHostFromUrl(remoteUrl) : null;
-
-              if (!remoteUrl || !host) {
-                vscode.window.showWarningMessage('当前仓库未找到 HTTPS 远程地址，无法自动切换凭据。');
-              } else if (!GitManager.isHttpRemoteUrl(remoteUrl)) {
-                vscode.window.showWarningMessage('当前仓库远程地址不是 HTTP/HTTPS 类型，凭据切换仅支持 HTTPS 远程。');
+              const result = await GitManager.configureWorkspaceCredential(
+                workspaceFolder.uri.fsPath,
+                platform,
+                account
+              );
+              if (result.configured) {
+                vscode.window.showInformationMessage(`✅ ${result.message}`);
               } else {
-                try {
-                  await GitManager.clearCredential(host);
-                  await GitManager.storeCredential(host, account.username, account.token);
-                  vscode.window.showInformationMessage(`✅ 已为远程 host ${host} 切换推送凭据。`);
-                } catch (credErr) {
-                  vscode.window.showErrorMessage(`切换凭据失败：${credErr}`);
-                }
+                vscode.window.showWarningMessage(result.message);
               }
             }
           } catch (err) {
@@ -101,7 +94,7 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
       }
 
       case 'deleteAccount': {
-        const { platform, id } = message as { platform: 'github' | 'gitee'; id: string };
+        const { platform, id } = message as { platform: Platform; id: string };
         const store = AccountManager.load();
         const account = store[platform].find(a => a.id === id);
         const confirm = await vscode.window.showWarningMessage(
@@ -122,7 +115,29 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ command: 'setLoading', loading });
   }
 
-  private _getHtmlContent(): string {
+  private async _addAccountForPlatform(platform: Platform): Promise<{
+    username: string;
+    name: string;
+    email: string;
+    avatarUrl: string;
+    token: string;
+  } | null> {
+    switch (platform) {
+      case 'github':
+        return GitHubAuth.addAccount();
+      case 'gitee':
+        return GiteeAuth.addAccount();
+      case 'gitlab':
+        return GitLabAuth.addAccount();
+      default:
+        return null;
+    }
+  }
+
+  private _getHtmlContent(webview: vscode.Webview): string {
+    const giteeLogo = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'gitee-logo.svg'));
+    const gitlabLogo = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'gitlab-logo.svg'));
+
     return /* html */`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -139,17 +154,24 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
     overflow-x: hidden;
   }
 
-  /* ── Tabs ── */
-  .tabs {
+  .topbar {
     display: flex;
+    align-items: center;
+    gap: 6px;
     border-bottom: 1px solid var(--vscode-panel-border, #444);
     position: sticky;
     top: 0;
     background: var(--vscode-sideBar-background, #252526);
     z-index: 10;
   }
-  .tab-btn {
+  .tabs {
+    display: flex;
+    min-width: 0;
     flex: 1;
+  }
+  .tab-btn {
+    min-width: 0;
+    flex: 1 1 0;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -168,12 +190,54 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
   .tab-btn:hover { opacity: 0.9; background: var(--vscode-list-hoverBackground); }
   .tab-btn.active { opacity: 1; border-bottom-color: var(--vscode-focusBorder, #007fd4); }
   .tab-btn svg { flex-shrink: 0; }
+  .platform-logo {
+    width: 16px;
+    height: 16px;
+    display: block;
+    object-fit: contain;
+    flex-shrink: 0;
+  }
+  .refresh-btn {
+    width: 28px;
+    height: 28px;
+    margin-right: 6px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--vscode-foreground);
+    opacity: 0.72;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 0.12s ease, opacity 0.12s ease, transform 0.12s ease;
+  }
+  .refresh-btn:hover {
+    opacity: 1;
+    background: var(--vscode-list-hoverBackground);
+  }
+  .refresh-btn:active { transform: rotate(15deg); }
 
-  /* ── Content ── */
   .tab-content { display: none; padding: 8px 0; }
   .tab-content.visible { display: block; }
+  .list-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 2px 10px 8px;
+  }
+  .list-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    opacity: 0.58;
+  }
+  .list-count {
+    font-size: 11px;
+    opacity: 0.48;
+  }
 
-  /* ── Account item ── */
   .account-list { display: flex; flex-direction: column; gap: 2px; padding: 0 6px; }
 
   .account-item {
@@ -230,7 +294,6 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
   .account-item:hover .delete-btn { display: flex; align-items: center; }
   .delete-btn:hover { background: var(--vscode-inputValidation-errorBackground); }
 
-  /* ── Add button ── */
   .add-btn {
     display: flex;
     align-items: center;
@@ -251,7 +314,6 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
   }
   .add-btn:hover { opacity: 1; background: var(--vscode-list-hoverBackground); }
 
-  /* ── Empty state ── */
   .empty-state {
     text-align: center;
     padding: 24px 16px 8px;
@@ -260,7 +322,6 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
     line-height: 1.6;
   }
 
-  /* ── Loading overlay ── */
   .loading-mask {
     display: none;
     position: fixed;
@@ -283,10 +344,9 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
 
-<!-- Tabs -->
-<div class="tabs">
-  <button class="tab-btn active" id="tab-github" onclick="switchTab('github')">
-    <!-- GitHub Mark SVG -->
+<div class="topbar">
+  <div class="tabs">
+    <button class="tab-btn active" id="tab-github" onclick="switchTab('github')">
     <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
       <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
                0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
@@ -298,21 +358,28 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
                0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
     </svg>
     GitHub
-  </button>
-  <button class="tab-btn" id="tab-gitee" onclick="switchTab('gitee')">
-    <!-- Gitee Logo SVG (simplified) -->
-    <svg width="16" height="16" viewBox="0 0 32 32" fill="currentColor">
-      <path d="M16 0C7.163 0 0 7.163 0 16s7.163 16 16 16 16-7.163 16-16S24.837 0 16 0z
-               M8.5 22.5v-13h5.25c2.9 0 4.75 1.5 4.75 4 0 1.6-.8 2.8-2.1 3.4l2.85 5.6h-3.2
-               l-2.5-5h-1.8v5H8.5zm3.25-7.5h1.85c1.15 0 1.9-.65 1.9-1.75S14.75 11.5 13.6 11.5
-               h-1.85V15zM21 22.5v-13h3.25V22.5H21z"/>
-    </svg>
+    </button>
+    <button class="tab-btn" id="tab-gitee" onclick="switchTab('gitee')">
+      <img class="platform-logo" src="${giteeLogo}" alt="Gitee logo" />
     Gitee
+    </button>
+    <button class="tab-btn" id="tab-gitlab" onclick="switchTab('gitlab')">
+      <img class="platform-logo" src="${gitlabLogo}" alt="GitLab logo" />
+      GitLab
+    </button>
+  </div>
+  <button class="refresh-btn" type="button" title="刷新账户列表" onclick="refreshAccounts()">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+      <path d="M8 2a6 6 0 1 0 5.19 3H11.5a.75.75 0 0 1 0-1.5H15a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0V6.31A7.5 7.5 0 1 1 8 .5a7.47 7.47 0 0 1 5.3 2.2.75.75 0 0 1-1.06 1.06A5.98 5.98 0 0 0 8 2Z"/>
+    </svg>
   </button>
 </div>
 
-<!-- GitHub Tab Content -->
 <div class="tab-content visible" id="content-github">
+  <div class="list-toolbar">
+    <div class="list-title">GitHub Accounts</div>
+    <div class="list-count" id="count-github">0</div>
+  </div>
   <div class="account-list" id="list-github"></div>
   <button class="add-btn" onclick="addAccount('github')">
     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
@@ -323,8 +390,11 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
   </button>
 </div>
 
-<!-- Gitee Tab Content -->
 <div class="tab-content" id="content-gitee">
+  <div class="list-toolbar">
+    <div class="list-title">Gitee Accounts</div>
+    <div class="list-count" id="count-gitee">0</div>
+  </div>
   <div class="account-list" id="list-gitee"></div>
   <button class="add-btn" onclick="addAccount('gitee')">
     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
@@ -335,17 +405,30 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
   </button>
 </div>
 
-<!-- Loading Mask -->
+<div class="tab-content" id="content-gitlab">
+  <div class="list-toolbar">
+    <div class="list-title">GitLab Accounts</div>
+    <div class="list-count" id="count-gitlab">0</div>
+  </div>
+  <div class="account-list" id="list-gitlab"></div>
+  <button class="add-btn" onclick="addAccount('gitlab')">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+      <path d="M8 2a.75.75 0 01.75.75v4.5h4.5a.75.75 0 010 1.5h-4.5v4.5a.75.75 0 01-1.5
+               0v-4.5h-4.5a.75.75 0 010-1.5h4.5v-4.5A.75.75 0 018 2z"/>
+    </svg>
+    添加 GitLab 账户
+  </button>
+</div>
+
 <div class="loading-mask" id="loadingMask">
   <div class="spinner"></div>
 </div>
 
 <script>
   const vscode = acquireVsCodeApi();
-  let accounts = { github: [], gitee: [] };
+  let accounts = { github: [], gitee: [], gitlab: [] };
   let currentTab = 'github';
 
-  // ── Tab switching ──
   function switchTab(tab) {
     currentTab = tab;
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -354,9 +437,11 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
     document.getElementById('content-' + tab).classList.add('visible');
   }
 
-  // ── Message handlers ──
   function addAccount(platform) {
     vscode.postMessage({ command: 'addAccount', platform });
+  }
+  function refreshAccounts() {
+    vscode.postMessage({ command: 'refresh' });
   }
   function switchAccount(platform, id) {
     vscode.postMessage({ command: 'switchAccount', platform, id });
@@ -366,10 +451,10 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
     vscode.postMessage({ command: 'deleteAccount', platform, id });
   }
 
-  // ── Render ──
   function renderList(platform) {
     const list = document.getElementById('list-' + platform);
     const items = accounts[platform] || [];
+    document.getElementById('count-' + platform).textContent = items.length + ' 个账号';
 
     if (items.length === 0) {
       list.innerHTML = '<div class="empty-state">暂无账户<br>点击下方按钮添加</div>';
@@ -394,7 +479,7 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
           </div>
           \${isActive ? '<div class="active-badge" title="当前激活"></div>' : ''}
           <button class="delete-btn" title="删除账户"
-                  onclick="deleteAccount('\${platform}', '\${escHtml(acc.id)}', event)">✕</button>
+                  onclick="deleteAccount('\${platform}', '\${escHtml(acc.id)}', event)">×</button>
         </div>
       \`;
     }).join('');
@@ -416,13 +501,13 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
       accounts = msg.accounts;
       renderList('github');
       renderList('gitee');
+      renderList('gitlab');
     } else if (msg.command === 'setLoading') {
       const mask = document.getElementById('loadingMask');
       mask.classList.toggle('visible', msg.loading);
     }
   });
 
-  // Init
   vscode.postMessage({ command: 'ready' });
 </script>
 </body>

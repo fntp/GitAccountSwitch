@@ -11607,3 +11607,7 @@ node_modules/yazl/index.js
 node_modules/yazl/LICENSE
 node_modules/yazl/package.json
 node_modules/yazl/README.md
+out/GitLabAuth.js
+out/GitLabAuth.js.map
+out/platform.js
+out/platform.js.map

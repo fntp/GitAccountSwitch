@@ -1,12 +1,12 @@
 {
   "name": "git-account-switcher",
   "displayName": "Git Account Switcher",
-  "description": "Quickly switch between GitHub and Gitee accounts globally",
+  "description": "Quickly switch between GitHub, Gitee and GitLab accounts globally",
   "version": "1.0.0",
   "publisher": "git-account-switcher",
   "engines": { "vscode": "^1.74.0" },
   "categories": ["SCM Providers", "Other"],
-  "keywords": ["git", "github", "gitee", "account", "switcher"],
+  "keywords": ["git", "github", "gitee", "gitlab", "account", "switcher"],
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
