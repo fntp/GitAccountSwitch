@@ -1,5 +1,8 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { Account } from './AccountManager';
 import { PLATFORM_META, Platform } from './platform';
 
@@ -149,30 +152,98 @@ export class GitManager {
   }
 
   /**
+   * Write a credential entry to ~/.git-credentials (git-credential-store format).
+   * Format: https://username:token@host
+   *
+   * This is the most reliable way to inject credentials because git reads this
+   * file directly — VS Code's GitHub OAuth interceptor never gets a chance to
+   * show a login popup.
+   */
+  static writeToCredentialStore(host: string, username: string, token: string): void {
+    const credFile = path.join(os.homedir(), '.git-credentials');
+
+    // Read existing file, strip any existing entry for this host
+    let lines: string[] = [];
+    if (fs.existsSync(credFile)) {
+      lines = fs.readFileSync(credFile, 'utf-8')
+        .split('\n')
+        .filter(l => l.trim() && !l.includes(`@${host}`));
+    }
+
+    // Append new entry: encode special chars in username/token
+    const u = encodeURIComponent(username);
+    const p = encodeURIComponent(token);
+    lines.push(`https://${u}:${p}@${host}`);
+
+    fs.writeFileSync(credFile, lines.join('\n') + '\n', { mode: 0o600 });
+  }
+
+  /**
+   * Remove all credential entries for the given host from ~/.git-credentials.
+   */
+  static removeFromCredentialStore(host: string): void {
+    const credFile = path.join(os.homedir(), '.git-credentials');
+    if (!fs.existsSync(credFile)) { return; }
+    const lines = fs.readFileSync(credFile, 'utf-8')
+      .split('\n')
+      .filter(l => l.trim() && !l.includes(`@${host}`));
+    fs.writeFileSync(credFile, lines.join('\n') + '\n', { mode: 0o600 });
+  }
+
+  /**
+   * Ensure git's global credential.helper includes "store".
+   *
+   * If the helper is already "store" or contains "store", do nothing.
+   * If it is set to something else (manager, osxkeychain, etc.), we prepend
+   * "store" by adding a second helper entry — git tries helpers in order,
+   * so "store" will satisfy the credential lookup before the other helper
+   * even runs, which prevents VS Code's GitHub OAuth popup.
+   * If no helper is set at all, we set it to "store".
+   */
+  static async ensureStoreHelperInChain(): Promise<void> {
+    try {
+      const { stdout } = await execAsync('git config --global --get-all credential.helper');
+      const helpers = stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
+      if (helpers.some(h => h === 'store')) {
+        return; // already present
+      }
+      // Prepend store so it runs first
+      await execAsync('git config --global --add credential.helper store');
+    } catch {
+      // No helper configured yet → just set store
+      try {
+        await execAsync('git config --global credential.helper store');
+      } catch { /* ignore */ }
+    }
+  }
+
+  /**
    * Switch Git credentials globally for the given platform account.
    *
-   * Strategy:
-   *  1. Unset global `credential.useHttpPath` — this key causes git to match
-   *     credentials by repo path, so leaving it true means only the specific
-   *     path we stored the credential for would match. We want host-wide matching.
-   *  2. Clear any existing credential for the platform host.
-   *  3. Store the new credential for the platform host WITHOUT a path, so it
-   *     matches every repository on that host automatically.
+   * Why direct file approach instead of `git credential approve`:
+   *   VS Code's built-in Git extension intercepts pushes and shows its own
+   *   GitHub Sign-in dialog BEFORE the system credential helper is consulted.
+   *   Writing directly to ~/.git-credentials bypasses that interceptor entirely
+   *   because git resolves file-based credentials at the protocol level before
+   *   VS Code authentication can fire.
    *
-   * After this call, `git push / pull / fetch` for any repo on the platform
-   * will use the new account's token without prompting.
+   * Steps:
+   *  1. Ensure `credential.helper store` is in the global helper chain.
+   *  2. Write the new token to ~/.git-credentials (replacing any old entry).
+   *  3. Unset global credential.useHttpPath so the host-level entry matches
+   *     every repo on that platform without path restrictions.
    */
   static async switchGlobalCredential(platform: Platform, account: Account): Promise<void> {
     const host = PLATFORM_META[platform].host;
 
-    // Step 1: Remove global useHttpPath so host-level matching works
+    // 1. Make sure git will use the file-based credential store
+    await this.ensureStoreHelperInChain();
+
+    // 2. Write/replace the credential entry directly
+    this.writeToCredentialStore(host, account.username, account.token);
+
+    // 3. Remove path-based matching so the host entry matches all repos
     await this.unsetGlobalConfig('credential.useHttpPath');
-
-    // Step 2: Clear existing credentials for this host (any username)
-    await this.clearCredential(host);
-
-    // Step 3: Store new credential (host-wide, no path)
-    await this.storeCredential(host, account.username, account.token);
   }
 
   /**
