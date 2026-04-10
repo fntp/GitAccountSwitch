@@ -256,39 +256,169 @@ export class GitManager {
     });
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Windows Credential Manager helpers
+  //
+  // On Windows, Git for Windows uses `manager` / `manager-core` / `wincred`
+  // as the default credential helper.  These helpers store tokens inside
+  // Windows Credential Manager (Control Panel → User Accounts → Credential
+  // Manager → Generic Credentials) under keys like:
+  //
+  //   git:https://github.com
+  //   GitHub for Visual Studio - https://<user>@github.com/
+  //
+  // Because Windows Credential Manager has HIGHER priority than the file-based
+  // store (~/.git-credentials), any entry there will shadow whatever the plugin
+  // writes to the store file — making credential switches appear to have no
+  // effect after the very first switch.
+  //
+  // The only reliable fix is to write the new credential DIRECTLY into Windows
+  // Credential Manager via `cmdkey`, while also removing all stale variants.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  static isWindows(): boolean {
+    return process.platform === 'win32';
+  }
+
+  /**
+   * Known target-name patterns that Git / VS Code write into Windows
+   * Credential Manager for a given host.  We must delete ALL of them before
+   * writing the new entry, otherwise the old one keeps winning.
+   */
+  private static windowsCredentialTargets(host: string, username?: string): string[] {
+    const targets = [
+      `git:https://${host}`,                          // Git for Windows / manager
+      `git:http://${host}`,                           // HTTP variant (rare)
+      `GitHub for Visual Studio - https://${host}/`,  // VS Code GitHub extension
+      `GitHub for Visual Studio - http://${host}/`,
+    ];
+
+    if (username) {
+      targets.push(`git:https://${username}@${host}`);
+      targets.push(`git:http://${username}@${host}`);
+      targets.push(`GitHub for Visual Studio - https://${username}@${host}/`);
+      targets.push(`GitHub for Visual Studio - http://${username}@${host}/`);
+    }
+
+    return targets;
+  }
+
+  /**
+   * Delete all known Git credential entries for a host from Windows
+   * Credential Manager using `cmdkey /delete`.  Ignores errors (the entry
+   * may already not exist).
+   */
+  static async clearWindowsCredentials(host: string, username?: string): Promise<void> {
+    if (!this.isWindows()) { return; }
+    const targets = this.windowsCredentialTargets(host, username);
+    for (const target of targets) {
+      try {
+        // cmdkey exit-code is non-zero when the entry doesn't exist — ignore.
+        await execAsync(`cmdkey /delete:"${target}"`);
+      } catch { /* not present — fine */ }
+    }
+  }
+
+  /**
+   * Write a credential directly into Windows Credential Manager.
+   * Uses `cmdkey /add` with the canonical `git:https://<host>` target so
+   * that `manager`, `manager-core`, and `wincred` all find it without
+   * needing any additional configuration.
+   *
+   * Falls back to git credential helper if cmdkey fails, since cmdkey has
+   * known issues with password length and special characters.
+   */
+  static async writeWindowsCredential(host: string, username: string, token: string): Promise<void> {
+    if (!this.isWindows()) { return; }
+    const target = `git:https://${host}`;
+    
+    try {
+      // First attempt: use cmdkey directly with proper escaping.
+      // Sanitize special characters that can break cmdkey.
+      const safeUser = username.replace(/"/g, '\\"').replace(/[%]/g, '%%');
+      const safePass = token.replace(/"/g, '\\"').replace(/[%]/g, '%%');
+      await execAsync(`cmdkey /add:"${target}" /user:"${safeUser}" /pass:"${safePass}"`);
+    } catch (cmdkeyError) {
+      // Fallback: use git credential helper if cmdkey fails.
+      // This is more reliable for edge cases (long passwords, special chars, etc).
+      try {
+        const credInput = this.buildCredentialInput(host, username, token);
+        await new Promise<void>((resolve, reject) => {
+          const child = exec('git credential approve', (err: any) => {
+            if (err) { reject(err); } else { resolve(); }
+          });
+          child.stdin?.write(credInput);
+          child.stdin?.end();
+        });
+      } catch (fallbackError) {
+        // Last resort: throw the original cmdkey error only if both methods fail
+        throw cmdkeyError;
+      }
+    }
+  }
+
   /**
    * Switch Git credentials globally for the given platform account.
    *
-   * Why direct file approach instead of `git credential approve`:
-   *   VS Code's built-in Git extension intercepts pushes and shows its own
-   *   GitHub Sign-in dialog BEFORE the system credential helper is consulted.
-   *   Writing directly to ~/.git-credentials bypasses that interceptor entirely
-   *   because git resolves file-based credentials at the protocol level before
-   *   VS Code authentication can fire.
+   * Platform-aware strategy:
    *
-   * Steps:
-   *  1. Ensure `credential.helper store` is in the global helper chain.
-   *  2. Write the new token to ~/.git-credentials (replacing any old entry).
-   *  3. Unset global credential.useHttpPath so the host-level entry matches
-   *     every repo on that platform without path restrictions.
+   *   Windows  — Write directly to Windows Credential Manager (cmdkey) after
+   *              deleting all stale entries.  Also write to ~/.git-credentials
+   *              as a fallback for tools that bypass the manager helper.
+   *              `credential.helper` is forced to `manager` (Git for Windows
+   *              default) so the Credential Manager entry is always consulted.
+   *
+   *   macOS / Linux — Ensure `store` is the first helper in the chain, evict
+   *              stale entries via `git credential reject`, then write to
+   *              ~/.git-credentials directly.
    */
   static async switchGlobalCredential(platform: Platform, account: Account): Promise<void> {
     const host = PLATFORM_META[platform].host;
 
-    // 1. Make sure `store` is the FIRST helper in the chain.
-    //    This must happen before any credential read so git never reaches a
-    //    higher-priority helper (osxkeychain / manager) that still holds old creds.
-    await this.ensureStoreHelperInChain();
+    if (this.isWindows()) {
+      // ── Windows path ──────────────────────────────────────────────────────
+      // 1. Remove ALL stale entries from Windows Credential Manager.
+      //    This covers `git:https://github.com`, the generic VS Code target,
+      //    and the username-specific VS Code target variant.
+      await this.clearWindowsCredentials(host, account.username);
 
-    // 2. Evict stale tokens from ALL helpers (OS keychain, manager, etc.).
-    //    Without this step the old cached credential is served before store
-    //    is consulted, making subsequent switches appear to have no effect.
-    await this.evictCredential(host);
+      // 2. Write the new credential into Windows Credential Manager directly.
+      //    `manager` / `wincred` will find this entry on the next git operation.
+      await this.writeWindowsCredential(host, account.username, account.token);
 
-    // 3. Write the new token directly to ~/.git-credentials (replaces old entry).
-    this.writeToCredentialStore(host, account.username, account.token);
+      // 3. Also write to ~/.git-credentials so command-line git (when using
+      //    the `store` helper) and tools that bypass the manager still work.
+      this.writeToCredentialStore(host, account.username, account.token);
 
-    // 4. Remove path-based matching so the host-level entry matches every repo.
+      // 4. Make sure the global helper is `manager` (the Windows default).
+      //    Some users may have accidentally set it to `store`; keep it as
+      //    `manager` on Windows because that is the only helper that reads
+      //    from Windows Credential Manager.
+      try {
+        const { stdout } = await execAsync('git config --global credential.helper');
+        const current = stdout.trim();
+        // Accept manager, manager-core, wincred — all read WCM.
+        if (!['manager', 'manager-core', 'wincred'].includes(current)) {
+          await execAsync('git config --global credential.helper manager');
+        }
+      } catch {
+        // Key not set — configure manager as the default.
+        await execAsync('git config --global credential.helper manager');
+      }
+    } else {
+      // ── macOS / Linux path ────────────────────────────────────────────────
+      // 1. Make sure `store` is the FIRST helper in the chain so git reaches
+      //    ~/.git-credentials before osxkeychain or any other helper.
+      await this.ensureStoreHelperInChain();
+
+      // 2. Evict stale tokens from all helpers (osxkeychain, etc.).
+      await this.evictCredential(host);
+
+      // 3. Write the new token to ~/.git-credentials.
+      this.writeToCredentialStore(host, account.username, account.token);
+    }
+
+    // 5. Remove path-based matching so the host-level entry matches every repo.
     await this.unsetGlobalConfig('credential.useHttpPath');
   }
 

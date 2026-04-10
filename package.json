@@ -4,10 +4,24 @@
   "description": "Quickly switch between GitHub, Gitee and GitLab accounts globally",
   "version": "1.0.0",
   "publisher": "git-account-switcher",
-  "engines": { "vscode": "^1.74.0" },
-  "categories": ["SCM Providers", "Other"],
-  "keywords": ["git", "github", "gitee", "gitlab", "account", "switcher"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "keywords": [
+    "git",
+    "github",
+    "gitee",
+    "gitlab",
+    "account",
+    "switcher"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -41,9 +55,9 @@
     "package": "npx vsce package"
   },
   "devDependencies": {
-    "@types/node": "^18.0.0",
+    "@types/node": "^18.19.130",
     "@types/vscode": "^1.74.0",
-    "typescript": "^5.0.0",
-    "@vscode/vsce": "^2.0.0"
+    "@vscode/vsce": "^2.0.0",
+    "typescript": "^5.0.0"
   }
 }

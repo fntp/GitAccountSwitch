@@ -114,7 +114,13 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
               `✅ 已切换 ${PLATFORM_META[platform].label} 账户 → ${account.username}，所有仓库凭据已全局更新`
             );
           } catch (err) {
-            vscode.window.showErrorMessage(`切换失败: ${err}`);
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            console.error('[Git Account Switcher] Switch credential failed:', err);
+            vscode.window.showErrorMessage(`切换失败: ${errorMsg}`, '查看日志').then(action => {
+              if (action === '查看日志') {
+                vscode.commands.executeCommand('workbench.action.toggleDevTools');
+              }
+            });
             // Refresh so UI stays in sync with stored state (active flag not updated).
             this.refresh();
           }
