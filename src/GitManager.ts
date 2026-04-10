@@ -191,30 +191,69 @@ export class GitManager {
   }
 
   /**
-   * Ensure git's global credential.helper includes "store".
+   * Ensure `credential.helper store` is the FIRST entry in the global chain.
    *
-   * If the helper is already "store" or contains "store", do nothing.
-   * If it is set to something else (manager, osxkeychain, etc.), we prepend
-   * "store" by adding a second helper entry — git tries helpers in order,
-   * so "store" will satisfy the credential lookup before the other helper
-   * even runs, which prevents VS Code's GitHub OAuth popup.
-   * If no helper is set at all, we set it to "store".
+   * Why "first" matters:
+   *   git tries helpers in the order they appear in config.  If osxkeychain /
+   *   manager / manager-core comes before store, git finds the OLD cached token
+   *   there and never reaches ~/.git-credentials — so account switches appear
+   *   to have no effect after the very first switch.
+   *
+   * Algorithm:
+   *   1. Read all current helpers.
+   *   2. If store is already [0], do nothing.
+   *   3. Otherwise clear the whole list and re-write it with store first,
+   *      followed by the original helpers (minus any existing store entries).
    */
   static async ensureStoreHelperInChain(): Promise<void> {
+    let helpers: string[] = [];
     try {
       const { stdout } = await execAsync('git config --global --get-all credential.helper');
-      const helpers = stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
-      if (helpers.some(h => h === 'store')) {
-        return; // already present
-      }
-      // Prepend store so it runs first
-      await execAsync('git config --global --add credential.helper store');
+      helpers = stdout.trim().split('\n').map(s => s.trim()).filter(Boolean);
     } catch {
-      // No helper configured yet → just set store
+      // exit-code 1 means the key doesn't exist yet — helpers stays []
+    }
+
+    if (helpers[0] === 'store') {
+      return; // already first — nothing to do
+    }
+
+    // Remove all existing entries, then re-add in the correct order.
+    // We must unset-all first because git config --add can only append.
+    try {
+      if (helpers.length > 0) {
+        await execAsync('git config --global --unset-all credential.helper');
+      }
+      // Set store as the primary (first) entry
+      await execAsync('git config --global credential.helper store');
+      // Re-append the original helpers (skip any stale 'store' duplicates)
+      for (const h of helpers.filter(h => h !== 'store')) {
+        await execAsync(`git config --global --add credential.helper "${h}"`);
+      }
+    } catch {
+      // Last-resort fallback: just force store as the sole helper
       try {
         await execAsync('git config --global credential.helper store');
       } catch { /* ignore */ }
     }
+  }
+
+  /**
+   * Evict any credential for the given host from ALL configured helpers
+   * (OS keychain, manager, etc.) by running `git credential reject`.
+   *
+   * This must be called BEFORE writing the new credential to the store file,
+   * so that a subsequent git operation cannot pick up a stale token from a
+   * higher-priority helper.
+   */
+  static async evictCredential(host: string, username?: string): Promise<void> {
+    const credInput = this.buildCredentialInput(host, username);
+    await new Promise<void>((resolve) => {
+      // Always resolve — eviction is best-effort; errors are non-fatal.
+      const child = exec('git credential reject', () => resolve());
+      child.stdin?.write(credInput);
+      child.stdin?.end();
+    });
   }
 
   /**
@@ -236,13 +275,20 @@ export class GitManager {
   static async switchGlobalCredential(platform: Platform, account: Account): Promise<void> {
     const host = PLATFORM_META[platform].host;
 
-    // 1. Make sure git will use the file-based credential store
+    // 1. Make sure `store` is the FIRST helper in the chain.
+    //    This must happen before any credential read so git never reaches a
+    //    higher-priority helper (osxkeychain / manager) that still holds old creds.
     await this.ensureStoreHelperInChain();
 
-    // 2. Write/replace the credential entry directly
+    // 2. Evict stale tokens from ALL helpers (OS keychain, manager, etc.).
+    //    Without this step the old cached credential is served before store
+    //    is consulted, making subsequent switches appear to have no effect.
+    await this.evictCredential(host);
+
+    // 3. Write the new token directly to ~/.git-credentials (replaces old entry).
     this.writeToCredentialStore(host, account.username, account.token);
 
-    // 3. Remove path-based matching so the host entry matches all repos
+    // 4. Remove path-based matching so the host-level entry matches every repo.
     await this.unsetGlobalConfig('credential.useHttpPath');
   }
 

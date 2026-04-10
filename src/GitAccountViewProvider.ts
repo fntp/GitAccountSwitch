@@ -20,6 +20,16 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this._getHtmlContent(webviewView.webview);
     webviewView.webview.onDidReceiveMessage(msg => this._handleMessage(msg));
+
+    // Re-push current account state whenever the panel becomes visible again.
+    // Without this, after hiding/collapsing the sidebar the list shows stale
+    // data because 'ready' is only sent once (on first webview creation) and
+    // retainContextWhenHidden keeps the JS alive without re-firing it.
+    webviewView.onDidChangeVisibility(() => {
+      if (webviewView.visible) {
+        this.refresh();
+      }
+    });
   }
 
   refresh(): void {
@@ -42,13 +52,28 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
         try {
           const userInfo = await this._addAccountForPlatform(platform);
           if (userInfo) {
-            AccountManager.addAccount(platform, {
+            const added = AccountManager.addAccount(platform, {
               username: userInfo.username,
               name: userInfo.name,
               email: userInfo.email,
               avatarUrl: userInfo.avatarUrl,
               token: userInfo.token,
             });
+            // If this is the first account for the platform, AccountManager
+            // automatically marks it active — but it never actually configures
+            // git credentials. Do it now so the "active" badge reflects reality.
+            if (added.active) {
+              try {
+                await GitManager.setGlobalUser(added.name || added.username, added.email);
+                await GitManager.switchGlobalCredential(platform, added);
+                const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+                for (const folder of workspaceFolders) {
+                  await GitManager.cleanupLocalCredentialConfig(folder.uri.fsPath);
+                }
+              } catch {
+                // Non-fatal: account is stored; user can switch manually.
+              }
+            }
             vscode.window.showInformationMessage(`✅ 已添加 ${PLATFORM_META[platform].label} 账户：${userInfo.username}`);
             this.refresh();
           }
@@ -81,17 +106,21 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
               await GitManager.cleanupLocalCredentialConfig(folder.uri.fsPath);
             }
 
-            // 4. Persist the active account selection
+            // 4. Persist the active account selection and refresh UI only on success.
             AccountManager.setActive(platform, id);
+            this.refresh();
 
             vscode.window.showInformationMessage(
               `✅ 已切换 ${PLATFORM_META[platform].label} 账户 → ${account.username}，所有仓库凭据已全局更新`
             );
           } catch (err) {
             vscode.window.showErrorMessage(`切换失败: ${err}`);
+            // Refresh so UI stays in sync with stored state (active flag not updated).
+            this.refresh();
           }
+        } else {
+          this.refresh();
         }
-        this.refresh();
         break;
       }
 
