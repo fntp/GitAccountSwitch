@@ -64,27 +64,29 @@ export class GitAccountViewProvider implements vscode.WebviewViewProvider {
         const account = store[platform].find(a => a.id === id);
         if (account) {
           try {
+            // 1. Update global git user identity (name + email)
             await GitManager.setGlobalUser(account.name || account.username, account.email);
-            AccountManager.setActive(platform, id);
-            vscode.window.showInformationMessage(
-              `✅ 已切换全局 Git 身份 → ${account.username} <${account.email}>`
-            );
 
-            const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-            if (!workspaceFolder) {
-              vscode.window.showWarningMessage('未检测到工作区，无法自动切换当前仓库的 Git 凭据。');
-            } else {
-              const result = await GitManager.configureWorkspaceCredential(
-                workspaceFolder.uri.fsPath,
-                platform,
-                account
-              );
-              if (result.configured) {
-                vscode.window.showInformationMessage(`✅ ${result.message}`);
-              } else {
-                vscode.window.showWarningMessage(result.message);
-              }
+            // 2. Switch the platform credential globally (host-wide, no per-path isolation).
+            //    This replaces the stored token for github.com / gitee.com / gitlab.com so
+            //    every repo on that host — initialized or not, open or not — will use the
+            //    new account on the next push / pull / fetch.
+            await GitManager.switchGlobalCredential(platform, account);
+
+            // 3. Clean up any per-repo credential overrides left by previous versions of
+            //    this extension (credential.useHttpPath=true / credential.username written
+            //    as local git config). These would override the global credential we just set.
+            const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+            for (const folder of workspaceFolders) {
+              await GitManager.cleanupLocalCredentialConfig(folder.uri.fsPath);
             }
+
+            // 4. Persist the active account selection
+            AccountManager.setActive(platform, id);
+
+            vscode.window.showInformationMessage(
+              `✅ 已切换 ${PLATFORM_META[platform].label} 账户 → ${account.username}，所有仓库凭据已全局更新`
+            );
           } catch (err) {
             vscode.window.showErrorMessage(`切换失败: ${err}`);
           }

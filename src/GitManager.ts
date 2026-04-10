@@ -42,8 +42,26 @@ export class GitManager {
     }
   }
 
-  static async isCredentialUseHttpPath(cwd?: string): Promise<boolean> {
-    return (await this.getConfig('credential.useHttpPath', cwd)).toLowerCase() === 'true';
+  /**
+   * Unset a global git config key. Ignores errors (key may not exist).
+   */
+  static async unsetGlobalConfig(key: string): Promise<void> {
+    try {
+      await execAsync(`git config --global --unset ${key}`);
+    } catch {
+      // Ignore: config key may not be set
+    }
+  }
+
+  /**
+   * Unset a local git config key in the given repo. Ignores errors.
+   */
+  static async unsetLocalConfig(key: string, cwd: string): Promise<void> {
+    try {
+      await execAsync(`git config --local --unset ${key}`, { cwd });
+    } catch {
+      // Ignore: config key may not be set, or not a git repo
+    }
   }
 
   static async setLocalConfig(key: string, value: string, cwd: string): Promise<void> {
@@ -82,22 +100,6 @@ export class GitManager {
     }
   }
 
-  static parsePathFromUrl(url: string): string | undefined {
-    if (!url) { return undefined; }
-    if (url.startsWith('git@')) {
-      const parts = url.split(':');
-      if (parts.length < 2) { return undefined; }
-      const path = parts.slice(1).join(':');
-      return path.startsWith('/') ? path : `/${path}`;
-    }
-    try {
-      const parsed = new URL(url);
-      return parsed.pathname || undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
   static isHttpRemoteUrl(url: string): boolean {
     return /^https?:\/\//i.test(url);
   }
@@ -106,11 +108,8 @@ export class GitManager {
     return this.normalizeHost(host) === this.normalizeHost(PLATFORM_META[platform].host);
   }
 
-  private static buildCredentialInput(host: string, username?: string, password?: string, path?: string): string {
+  private static buildCredentialInput(host: string, username?: string, password?: string): string {
     let input = `protocol=https\nhost=${host}\n`;
-    if (path) {
-      input += `path=${path}\n`;
-    }
     if (username) {
       input += `username=${username}\n`;
     }
@@ -121,11 +120,11 @@ export class GitManager {
   }
 
   /**
-   * Store credential in git credential store
-   * Uses git credential approve to store token as password for the host
+   * Store credential globally (no path) via `git credential approve`.
+   * This makes the credential apply to ALL repos on the given host.
    */
-  static async storeCredential(host: string, username: string, token: string, path?: string): Promise<void> {
-    const credInput = this.buildCredentialInput(host, username, token, path);
+  static async storeCredential(host: string, username: string, token: string): Promise<void> {
+    const credInput = this.buildCredentialInput(host, username, token);
     await new Promise<void>((resolve, reject) => {
       const child = exec('git credential approve', (err: any) => {
         if (err) { reject(err); } else { resolve(); }
@@ -136,10 +135,10 @@ export class GitManager {
   }
 
   /**
-   * Clear stored credentials for a host
+   * Clear stored credentials for a host via `git credential reject`.
    */
-  static async clearCredential(host: string, path?: string, username?: string): Promise<void> {
-    const credInput = this.buildCredentialInput(host, username, undefined, path);
+  static async clearCredential(host: string, username?: string): Promise<void> {
+    const credInput = this.buildCredentialInput(host, username);
     await new Promise<void>((resolve, reject) => {
       const child = exec('git credential reject', (err: any) => {
         if (err) { reject(err); } else { resolve(); }
@@ -149,60 +148,41 @@ export class GitManager {
     });
   }
 
-  static async configureWorkspaceCredential(cwd: string, platform: Platform, account: Account): Promise<{
-    configured: boolean;
-    message: string;
-    host?: string;
-  }> {
-    const remoteUrl = await this.getRemoteUrl(cwd);
-    if (!remoteUrl) {
-      return {
-        configured: false,
-        message: '当前仓库未找到远程地址，已仅切换全局 Git 身份。',
-      };
-    }
+  /**
+   * Switch Git credentials globally for the given platform account.
+   *
+   * Strategy:
+   *  1. Unset global `credential.useHttpPath` — this key causes git to match
+   *     credentials by repo path, so leaving it true means only the specific
+   *     path we stored the credential for would match. We want host-wide matching.
+   *  2. Clear any existing credential for the platform host.
+   *  3. Store the new credential for the platform host WITHOUT a path, so it
+   *     matches every repository on that host automatically.
+   *
+   * After this call, `git push / pull / fetch` for any repo on the platform
+   * will use the new account's token without prompting.
+   */
+  static async switchGlobalCredential(platform: Platform, account: Account): Promise<void> {
+    const host = PLATFORM_META[platform].host;
 
-    const host = this.parseHostFromUrl(remoteUrl);
-    if (!host) {
-      return {
-        configured: false,
-        message: '当前仓库远程地址无法解析 host，已仅切换全局 Git 身份。',
-      };
-    }
+    // Step 1: Remove global useHttpPath so host-level matching works
+    await this.unsetGlobalConfig('credential.useHttpPath');
 
-    if (!this.isHttpRemoteUrl(remoteUrl)) {
-      return {
-        configured: false,
-        message: '当前仓库远程地址不是 HTTP/HTTPS，无法自动改写 PAT 凭据。',
-      };
-    }
-
-    if (!this.isPlatformHost(platform, host)) {
-      return {
-        configured: false,
-        message: `当前仓库远程 host 是 ${host}，与所选 ${PLATFORM_META[platform].label} 账号不匹配，已仅切换全局 Git 身份。`,
-      };
-    }
-
-    const credentialPath = this.parsePathFromUrl(remoteUrl);
-    if (!credentialPath) {
-      return {
-        configured: false,
-        message: '当前仓库远程地址无法解析仓库路径，已仅切换全局 Git 身份。',
-      };
-    }
-
-    await this.setLocalConfig('credential.useHttpPath', 'true', cwd);
-    await this.setLocalConfig('credential.username', account.username, cwd);
-
+    // Step 2: Clear existing credentials for this host (any username)
     await this.clearCredential(host);
-    await this.clearCredential(host, credentialPath);
-    await this.storeCredential(host, account.username, account.token, credentialPath);
 
-    return {
-      configured: true,
-      message: `已为 ${host}${credentialPath} 切换凭据，并启用按仓库路径隔离。`,
-      host,
-    };
+    // Step 3: Store new credential (host-wide, no path)
+    await this.storeCredential(host, account.username, account.token);
+  }
+
+  /**
+   * Remove per-repo credential overrides that may have been written by
+   * a previous version of this extension. Call this for every open workspace
+   * folder after switching accounts.
+   */
+  static async cleanupLocalCredentialConfig(cwd: string): Promise<void> {
+    // These local overrides interfere with host-wide credential matching
+    await this.unsetLocalConfig('credential.useHttpPath', cwd);
+    await this.unsetLocalConfig('credential.username', cwd);
   }
 }
